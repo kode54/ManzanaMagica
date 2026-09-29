@@ -1,0 +1,11 @@
+/build/
+/compile_commands.json
+*.ts
+/.cache/
+/fixtures/
+/.build/
+/.swiftpm/
+/App/**/xcuserdata/
+*.xcresult
+*.profraw
+.DS_Store
