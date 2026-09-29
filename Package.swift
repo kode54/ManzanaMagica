@@ -64,6 +64,10 @@ let package = Package(
             name: "MagicaCoreTests",
             dependencies: ["MagicaCore"]
         ),
+        .testTarget(
+            name: "MagicaCaptureTests",
+            dependencies: ["MagicaCapture", "MagicaCore"]
+        ),
     ],
     cLanguageStandard: .gnu11
 )

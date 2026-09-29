@@ -26,6 +26,9 @@ struct ManzanaMagicaApp: App {
                 Picker("Standard", selection: $model.standardChoice) {
                     ForEach(StandardChoice.allCases) { Text($0.name).tag($0) }
                 }
+                Picker("Scan", selection: $model.scanMode) {
+                    ForEach(ScanMode.allCases) { Text($0.name).tag($0) }
+                }
                 Picker("Deinterlace", selection: $model.deinterlace) {
                     ForEach(DeinterlaceMode.allCases) { Text($0.name).tag($0) }
                 }
@@ -48,6 +51,16 @@ struct ManzanaMagicaApp: App {
         Settings {
             SettingsView()
                 .environment(model)
+        }
+    }
+}
+
+extension ScanMode {
+    var name: String {
+        switch self {
+        case .auto: String(localized: "Automatic")
+        case .interlaced: String(localized: "Interlaced (480i/576i)")
+        case .progressive: String(localized: "Progressive (240p/288p)")
         }
     }
 }

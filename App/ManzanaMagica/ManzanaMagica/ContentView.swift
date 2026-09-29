@@ -94,7 +94,7 @@ struct StatsHUD: View {
                 Text("\(info.board): \(info.bridge), \(info.decoder), \(info.audio)")
             }
             Text("Signal: \(st.locked ? "locked" : "no lock"), \(st.is50Hz ? "50" : "60") Hz, colour \(st.color ? "yes" : "no")")
-            Text("Standard: \(model.standard.name), \(model.standard.height) lines")
+            Text("Standard: \(model.standard.name) \(model.scanLabel), decoder says \(st.interlaced ? "interlaced" : "progressive")")
             Text("Fields: \(st.fields), short \(st.shortFields), USB errors \(st.packetErrors)")
             Text("Frames: \(s.frames) in, \(s.output) out, \(s.dropped) dropped, \(s.incomplete) incomplete, \(s.rendererFlushes) renderer flushes")
             Text("Deinterlace: \(s.mode.name), GPU \(s.gpuTime * 1000, specifier: "%.2f") ms/field")

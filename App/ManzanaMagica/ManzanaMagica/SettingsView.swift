@@ -10,9 +10,15 @@ struct SettingsView: View {
         @Bindable var model = model
         TabView {
             Form {
+                Picker("Scan", selection: $model.scanMode) {
+                    ForEach(ScanMode.allCases) { Text($0.name).tag($0) }
+                }
                 Picker("Deinterlacing", selection: $model.deinterlace) {
                     ForEach(DeinterlaceMode.allCases) { Text($0.name).tag($0) }
                 }
+                Text("Game consoles before the GameCube mostly send 240p (288p in PAL regions): every field is a whole picture, shown line-doubled at 60 (50) frames per second. Deinterlacing only applies to 480i/576i.")
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
                 Section("Picture") {
                     Slider(value: $model.picture.brightness, in: 0...255, step: 1) { Text("Brightness") }
                     Slider(value: $model.picture.contrast, in: 0...127, step: 1) { Text("Contrast") }

@@ -65,8 +65,21 @@ public enum VideoStandard: String, Sendable, CaseIterable, Identifiable {
     public var height: Int { is50Hz ? 576 : 480 }
     /// One frame (two fields)
     public var frameDuration: CMTime { is50Hz ? CMTime(value: 1, timescale: 25) : CMTime(value: 1001, timescale: 30000) }
+    /// One field, which is a whole picture from a 240p/288p source
+    public var fieldDuration: CMTime { is50Hz ? CMTime(value: 1, timescale: 50) : CMTime(value: 1001, timescale: 60000) }
     /// ITU-R BT.601 sampling: 704 active of 720 samples map to 4:3
     public var pixelAspect: (h: Int, v: Int) { is50Hz ? (12, 11) : (10, 11) }
+}
+
+/// How fields become pictures
+public enum ScanMode: String, Sendable, CaseIterable, Identifiable {
+    /// Follow the decoder's interlace detection (and fields that don't alternate)
+    case auto
+    /// Pair fields into frames for deinterlacing (480i/576i)
+    case interlaced
+    /// Every field is a whole picture, line-doubled (240p/288p from game consoles)
+    case progressive
+    public var id: String { rawValue }
 }
 
 public struct DeviceInfo: Sendable, Equatable {
@@ -84,6 +97,8 @@ public struct DeviceStatus: Sendable, Equatable {
     public var locked = false
     public var is50Hz = false
     public var color = false
+    /// The decoder sees an interlaced source; false for 240p/288p
+    public var interlaced = true
     public var fields: UInt32 = 0
     public var shortFields: UInt32 = 0
     public var packetErrors: UInt32 = 0
@@ -91,14 +106,17 @@ public struct DeviceStatus: Sendable, Equatable {
     public init() {}
 }
 
-/// One interlaced frame: two consecutive fields woven into biplanar 4:2:2
-/// ('422v'), the top field first in time
+/// One picture in biplanar 4:2:2 ('422v'): either two consecutive fields
+/// woven into an interlaced frame, the top field first in time, or, from a
+/// 240p/288p source, a single field with every line doubled
 public struct VideoFrame: @unchecked Sendable {
     public let image: CVPixelBuffer
     /// Host time (CMClockGetHostTimeClock) of the first field
     public let pts: CMTime
     public let duration: CMTime
     public let complete: Bool
+    /// false: a whole progressive picture that needs no deinterlacing
+    public let interlaced: Bool
 }
 
 /// The em28xx capture device. Controls are serialised by the C library;
@@ -168,6 +186,7 @@ public final class CaptureDevice: @unchecked Sendable {
         out.locked = s.locked != 0
         out.is50Hz = s.is_50hz != 0
         out.color = s.color != 0
+        out.interlaced = s.interlaced != 0
         out.fields = s.fields
         out.shortFields = s.short_fields
         out.packetErrors = s.packet_errors
@@ -176,6 +195,20 @@ public final class CaptureDevice: @unchecked Sendable {
     }
 
     public var isStreaming: Bool { lock.withLock { weaver != nil } }
+
+    /// Treat the source as 240p/288p (every field a picture). The app sets
+    /// this from the decoder's interlace detection; fields that stop
+    /// alternating between top and bottom are taken as progressive anyway.
+    public var progressive: Bool {
+        get { lock.withLock { _progressive } }
+        set {
+            lock.withLock {
+                _progressive = newValue
+                weaver?.progressive = newValue
+            }
+        }
+    }
+    private var _progressive = false
 
     /// Frames go to `frames` on the USB thread: hand them off quickly
     public func start(frames: @escaping @Sendable (VideoFrame) -> Void) throws {
@@ -189,6 +222,7 @@ public final class CaptureDevice: @unchecked Sendable {
     private func startLocked(_ sink: @escaping @Sendable (VideoFrame) -> Void) throws {
         guard weaver == nil else { return }
         let w = FieldWeaver(width: Int(magica_width(dev)), height: Int(magica_height(dev)), standard: standard, sink: sink)
+        w.progressive = _progressive
         let ctx = Unmanaged.passUnretained(w).toOpaque()
         let ret = magica_start(dev, { ctx, field in
             Unmanaged<FieldWeaver>.fromOpaque(ctx!).takeUnretainedValue().field(field!.pointee)
@@ -204,14 +238,25 @@ public final class CaptureDevice: @unchecked Sendable {
     }
 }
 
-/// Pairs each top field with the bottom field after it into one frame
+/// Pairs each top field with the bottom field after it into one frame, or,
+/// for a progressive source, line-doubles every field into its own picture
 final class FieldWeaver: @unchecked Sendable {
     let sink: @Sendable (VideoFrame) -> Void
     private let pool: CVPixelBufferPool
     private let standard: VideoStandard
+    private let lock = NSLock()
+    private var _progressive = false
+    // USB thread only
     private var current: CVPixelBuffer?
     private var currentPTS: CMTime = .invalid
     private var currentComplete = true
+    private var lastTop: Int32 = -1
+    private var sameParity = 0   // consecutive fields with the parity of the one before
+
+    var progressive: Bool {
+        get { lock.withLock { _progressive } }
+        set { lock.withLock { _progressive = newValue } }
+    }
 
     init(width: Int, height: Int, standard: VideoStandard, sink: @escaping @Sendable (VideoFrame) -> Void) {
         self.sink = sink
@@ -230,10 +275,24 @@ final class FieldWeaver: @unchecked Sendable {
     }
 
     func field(_ f: magica_field) {
+        sameParity = f.top == lastTop ? sameParity + 1 : 0
+        lastTop = f.top
+        // a 240p source may not alternate field parity at all: pairing would never finish a frame
+        if progressive || sameParity >= 2 {
+            current = nil
+            var pb: CVPixelBuffer?
+            guard CVPixelBufferPoolCreatePixelBuffer(nil, pool, &pb) == kCVReturnSuccess, let pb else { return }
+            Self.tag(pb, standard: standard, interlaced: false)
+            weave(f, into: pb, parity: 0)
+            weave(f, into: pb, parity: 1)
+            sink(VideoFrame(image: pb, pts: CMTime(value: CMTimeValue(f.time_ns), timescale: 1_000_000_000),
+                            duration: standard.fieldDuration, complete: f.complete != 0, interlaced: false))
+            return
+        }
         if f.top != 0 {
             var pb: CVPixelBuffer?
             guard CVPixelBufferPoolCreatePixelBuffer(nil, pool, &pb) == kCVReturnSuccess, let pb else { return }
-            Self.tag(pb, standard: standard)
+            Self.tag(pb, standard: standard, interlaced: true)
             current = pb
             currentPTS = CMTime(value: CMTimeValue(f.time_ns), timescale: 1_000_000_000)
             currentComplete = f.complete != 0
@@ -242,7 +301,7 @@ final class FieldWeaver: @unchecked Sendable {
             weave(f, into: pb, parity: 1)
             current = nil
             sink(VideoFrame(image: pb, pts: currentPTS, duration: standard.frameDuration,
-                            complete: currentComplete && f.complete != 0))
+                            complete: currentComplete && f.complete != 0, interlaced: true))
         }
         // a bottom field with no top before it (a dropped field) is skipped
     }
@@ -259,10 +318,16 @@ final class FieldWeaver: @unchecked Sendable {
     }
 
     /// Interlacing, BT.601 colour, and the 704-sample 4:3 picture area
-    static func tag(_ pb: CVPixelBuffer, standard: VideoStandard) {
+    static func tag(_ pb: CVPixelBuffer, standard: VideoStandard, interlaced: Bool) {
         let h = CVPixelBufferGetHeight(pb)
-        CVBufferSetAttachment(pb, kCVImageBufferFieldCountKey, 2 as CFNumber, .shouldPropagate)
-        CVBufferSetAttachment(pb, kCVImageBufferFieldDetailKey, kCVImageBufferFieldDetailTemporalTopFirst, .shouldPropagate)
+        if interlaced {
+            CVBufferSetAttachment(pb, kCVImageBufferFieldCountKey, 2 as CFNumber, .shouldPropagate)
+            CVBufferSetAttachment(pb, kCVImageBufferFieldDetailKey, kCVImageBufferFieldDetailTemporalTopFirst,
+                                  .shouldPropagate)
+        } else {
+            CVBufferSetAttachment(pb, kCVImageBufferFieldCountKey, 1 as CFNumber, .shouldPropagate)
+            CVBufferRemoveAttachment(pb, kCVImageBufferFieldDetailKey)
+        }
         CVBufferSetAttachment(pb, kCVImageBufferYCbCrMatrixKey, kCVImageBufferYCbCrMatrix_ITU_R_601_4, .shouldPropagate)
         CVBufferSetAttachment(pb, kCVImageBufferColorPrimariesKey,
                               standard.is50Hz ? kCVImageBufferColorPrimaries_EBU_3213 : kCVImageBufferColorPrimaries_SMPTE_C,

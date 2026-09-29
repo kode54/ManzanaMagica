@@ -16,6 +16,7 @@ public final class VideoPipeline: @unchecked Sendable {
         public var gpuTime: Double = 0  // last field, seconds
         public var mode: DeinterlaceMode = .yadif
         public var rendererFlushes = 0  // the renderer failed and was flushed to resume
+        public var progressiveSource = false  // the last picture was 240p/288p, shown line-doubled
         public init() {}
     }
 
@@ -121,8 +122,10 @@ public final class VideoPipeline: @unchecked Sendable {
         if !frame.complete { stats.incomplete += 1 }
         let mode = self.mode
         stats.mode = deinterlacer == nil ? .off : mode
+        stats.progressiveSource = !frame.interlaced
 
-        guard let deinterlacer, mode != .off else {
+        // 240p/288p: already a whole picture
+        guard frame.interlaced, let deinterlacer, mode != .off else {
             history.removeAll()
             output(frame.image, pts: frame.pts, duration: frame.duration)
             return

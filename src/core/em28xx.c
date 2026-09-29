@@ -454,6 +454,7 @@ int magica_status_get(magica_dev *d, magica_status *s)
 	s->locked = !(st & SAA7113_STATUS_HLVLN);
 	s->is_50hz = !(st & SAA7113_STATUS_FIDT);
 	s->color = !!(st & SAA7113_STATUS_RDCAP);
+	s->interlaced = !!(st & SAA7113_STATUS_INTL);
 	return 0;
 }
 

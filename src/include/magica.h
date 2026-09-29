@@ -82,6 +82,7 @@ typedef struct {
 	int locked;		/* the decoder has horizontal and vertical lock */
 	int is_50hz;		/* the decoder sees a 50 Hz signal */
 	int color;		/* a colour burst was detected (not 100% reliable) */
+	int interlaced;		/* the source is interlaced (480i/576i), not 240p/288p */
 	int streaming;
 	uint32_t fields;	/* delivered since start */
 	uint32_t short_fields;	/* cut short (lost packets) */

@@ -50,6 +50,10 @@ final class AppModel {
         get { defaults.string(forKey: "standard") ?? StandardChoice.auto.rawValue }
         set { defaults.set(newValue, forKey: "standard") }
     }
+    @ObservationIgnored private var storedScan: String {
+        get { defaults.string(forKey: "scan") ?? ScanMode.auto.rawValue }
+        set { defaults.set(newValue, forKey: "scan") }
+    }
     @ObservationIgnored private var storedDeinterlace: String {
         get { defaults.string(forKey: "deinterlace") ?? DeinterlaceMode.yadif.rawValue }
         set { defaults.set(newValue, forKey: "deinterlace") }
@@ -104,6 +108,20 @@ final class AppModel {
         set {
             withMutation(keyPath: \.standardChoice) { storedStandard = newValue.rawValue }
             if let s = newValue.standard { apply(standard: s) }
+        }
+    }
+
+    var scanMode: ScanMode {
+        get { access(keyPath: \.scanMode); return ScanMode(rawValue: storedScan) ?? .auto }
+        set {
+            withMutation(keyPath: \.scanMode) { storedScan = newValue.rawValue }
+            interlacedReadings = 0
+            progressiveReadings = 0
+            switch newValue {
+            case .auto: break  // the next status poll decides
+            case .interlaced: device?.progressive = false
+            case .progressive: device?.progressive = true
+            }
         }
     }
 
@@ -168,7 +186,10 @@ final class AppModel {
     /// USB control transfers take milliseconds each: keep them off the main thread
     @ObservationIgnored private let control = DispatchQueue(label: "magica.control", qos: .userInitiated)
     @ObservationIgnored private var tasks: [Task<Void, Never>] = []
-    @ObservationIgnored private var lockedSince: Date?
+    /// Consecutive status polls disagreeing with the current standard / scan
+    @ObservationIgnored private var rateMismatches = 0
+    @ObservationIgnored private var interlacedReadings = 0
+    @ObservationIgnored private var progressiveReadings = 0
 
     init() {
         pipeline = VideoPipeline(layer: layer, mode: deinterlace)
@@ -198,7 +219,7 @@ final class AppModel {
         case .waiting: String(localized: "Plug in the capture device")
         case .opening: String(localized: "Starting…")
         case .failed(let why): why
-        case .running: status.locked ? standard.name : String(localized: "No signal")
+        case .running: status.locked ? "\(standard.name) \(scanLabel)" : String(localized: "No signal")
         }
     }
 
@@ -209,11 +230,13 @@ final class AppModel {
         phase = .opening
         let input = self.input
         let choice = standardChoice
+        let scan = scanMode
         let pipeline = self.pipeline!
         control.async {
             let result: Result<(CaptureDevice, VideoStandard), Error> = Result {
                 let d = try CaptureDevice()
                 try d.setInput(input)
+                if case .progressive = scan { d.progressive = true }
                 var std = choice.standard ?? .ntsc
                 if choice == .auto {
                     // the decoder needs a moment to lock before it knows the field rate
@@ -311,20 +334,52 @@ final class AppModel {
             control.async { cont.resume(returning: device.status()) }
         }
         guard self.device === device else { return }
+        if s.locked != status.locked { log.info("signal: \(s.locked ? "locked" : "lost", privacy: .public)") }
         status = s
         if s.unplugged {
             disconnect(unplugged: true)
             return
         }
-        // follow the source between 525/60 and 625/50 once it has held lock a moment
-        if standardChoice == .auto, s.locked {
-            if lockedSince == nil { lockedSince = .now }
-            if let since = lockedSince, Date.now.timeIntervalSince(since) > 1, s.is50Hz != standard.is50Hz {
+        guard s.locked else {
+            rateMismatches = 0
+            return
+        }
+        // follow the source between 525/60 and 625/50 once it reads the same for 1.5 s
+        // (a console's mode switch can make one reading wrong)
+        if standardChoice == .auto, s.is50Hz != standard.is50Hz {
+            rateMismatches += 1
+            if rateMismatches >= 3 {
+                rateMismatches = 0
+                log.info("standard: source is \(s.is50Hz ? 50 : 60, privacy: .public) Hz, switching")
                 apply(standard: s.is50Hz ? .pal : .ntsc)
             }
         } else {
-            lockedSince = nil
+            rateMismatches = 0
         }
+        // 240p/288p or interlaced, from two readings in a row
+        if scanMode == .auto {
+            if s.interlaced {
+                interlacedReadings += 1
+                progressiveReadings = 0
+            } else {
+                progressiveReadings += 1
+                interlacedReadings = 0
+            }
+            if interlacedReadings == 2, device.progressive {
+                device.progressive = false
+                log.info("scan: interlaced (decoder status)")
+            }
+            if progressiveReadings == 2, !device.progressive {
+                device.progressive = true
+                log.info("scan: progressive (decoder status)")
+            }
+        }
+    }
+
+    /// "240p", "480i"…, from what's on screen
+    var scanLabel: String {
+        let progressive = stats.progressiveSource
+        return standard.is50Hz ? (progressive ? "288p" : "576i") : (progressive ? "240p" : "480i")
     }
 
     // MARK: - recording

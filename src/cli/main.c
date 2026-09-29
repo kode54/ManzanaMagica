@@ -41,8 +41,8 @@ static void print_status(magica_dev *d)
 		printf("status: %s\n", magica_strerror(ret));
 		return;
 	}
-	printf("signal %s, %s, colour %s\n", s.locked ? "LOCKED" : "no lock", s.is_50hz ? "50 Hz" : "60 Hz",
-	       s.color ? "yes" : "no");
+	printf("signal %s, %s, %s, colour %s\n", s.locked ? "LOCKED" : "no lock", s.is_50hz ? "50 Hz" : "60 Hz",
+	       s.interlaced ? "interlaced" : "progressive (240p/288p)", s.color ? "yes" : "no");
 }
 
 static int open_dev(magica_dev **d, magica_info *info)
@@ -93,12 +93,17 @@ struct cap {
 	int width, height;
 	int have_top;
 	uint32_t frames;
+	int last_top;
+	uint32_t repeats;	/* fields with the same parity as the one before */
 };
 
 static void on_field(void *ctx, const magica_field *f)
 {
 	struct cap *c = ctx;
 
+	if (f->seq > 0 && f->top == c->last_top)
+		c->repeats++;
+	c->last_top = f->top;
 	if (!c->out)
 		return;
 	/* weave: top field on even lines; a frame is top then bottom */
@@ -197,8 +202,9 @@ static int cmd_capture(int argc, char **argv)
 			fprintf(stderr, "device unplugged\n");
 			break;
 		}
-		fprintf(stderr, "fields %u (+%u) short %u packet errors %u, %s%s\n", s.fields, s.fields - last,
-			s.short_fields, s.packet_errors, s.locked ? "locked" : "NO LOCK", s.is_50hz ? " 50 Hz" : " 60 Hz");
+		fprintf(stderr, "fields %u (+%u) short %u parity repeats %u packet errors %u, %s%s%s\n", s.fields,
+			s.fields - last, s.short_fields, c.repeats, s.packet_errors, s.locked ? "locked" : "NO LOCK",
+			s.is_50hz ? " 50 Hz" : " 60 Hz", s.interlaced ? " interlaced" : " progressive");
 		last = s.fields;
 	}
 	magica_stop(d);
