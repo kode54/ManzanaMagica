@@ -7,7 +7,8 @@ import MagicaPlayback
 
 func usage() -> Never {
     FileHandle.standardError.write(Data("""
-    usage: mgtool record OUT.mov [--seconds N] [--input composite|svideo] [--std ntsc|pal|…]
+    usage: mgtool screenshot OUT.png [--input composite|svideo] [--std ntsc|pal|…] [--scan …] [--deinterlace …]
+           mgtool record OUT.mov [--seconds N] [--input composite|svideo] [--std ntsc|pal|…]
                                  [--codec h264|hevc] [--size native|hd720|hd720Pillarbox]
                                  [--deinterlace yadif|bob|off] [--scan auto|interlaced|progressive] [--no-audio] [--warmup S] [-v]
 
@@ -17,7 +18,9 @@ func usage() -> Never {
 
 setvbuf(stdout, nil, _IOLBF, 0)
 var args = Array(CommandLine.arguments.dropFirst())
-guard args.count >= 2, args.removeFirst() == "record" else { usage() }
+guard args.count >= 2 else { usage() }
+let command = args.removeFirst()
+guard command == "record" || command == "screenshot" else { usage() }
 let out = URL(fileURLWithPath: args.removeFirst())
 var verbose = false, warmup = 0.0, seconds = 10.0, input = VideoInput.composite, std: VideoStandard?, audio = true
 var options = RecordingOptions(), mode = DeinterlaceMode.yadif, scan = ScanMode.auto
@@ -69,6 +72,22 @@ capture?.start()
 try device.start { pipeline.push($0) }
 // like the app: sound and pictures running for a while before recording starts
 if warmup > 0 { try await Task.sleep(for: .seconds(warmup)) }
+
+if command == "screenshot" {
+    // long enough for the scan mode to settle and YADIF to have neighbours
+    try await Task.sleep(for: .seconds(1.5))
+    if scan == .auto, device.status().locked { device.progressive = !device.status().interlaced }
+    try await Task.sleep(for: .seconds(0.5))
+    guard let picture = pipeline.currentPicture() else {
+        print("no picture yet")
+        exit(1)
+    }
+    try Screenshot.writePNG(picture, to: out)
+    device.stop()
+    capture?.stop()
+    print("wrote \(out.path) (\(pipeline.currentStats().progressiveSource ? "progressive" : "interlaced") source)")
+    exit(0)
+}
 try? FileManager.default.removeItem(at: out)
 let recorder = try Recorder(url: out, options: options, standard: standard, audio: capture != nil)
 pipeline.recorder = recorder

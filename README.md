@@ -22,6 +22,9 @@ YADIF deinterlacer.
   native SD size (with its pixel aspect ratio flagged), or scaled to 720p with
   square pixels and BT.709 colour, ready for YouTube: 960×720 (4:3), or
   1280×720 with the picture pillarboxed.
+- **Take Screenshot** (⌘S, or the camera button) saves the picture on screen as a PNG in
+  Pictures/ManzanaMagica, in square pixels at its 4:3 shape (640×480, or 768×576 for PAL)
+  and sRGB colour.
 - The sound comes from the device's USB Audio Class interface, which macOS
   drives itself. The app plays it live and needs microphone permission for
   that.
@@ -34,6 +37,7 @@ make                                           # or swift build: .build/debug/ma
 ./magica -v capture --input svideo --seconds 5 --out cap.yuv
 ffplay -f rawvideo -pixel_format yuyv422 -video_size 720x480 cap.yuv
 .build/debug/mgtool record out.mov --input svideo --seconds 30 --codec hevc --size hd720
+.build/debug/mgtool screenshot shot.png --input svideo
 ```
 
 `-v`, `-vv` and `-vvv` add info, debug and USB register traces.

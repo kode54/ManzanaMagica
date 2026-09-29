@@ -38,7 +38,11 @@ final class AppModel {
     var recording: Recorder?
     var recordingSeconds: Double = 0
     var lastRecording: URL?
+    var lastScreenshot: URL?
     var alert: String?
+    /// A short confirmation shown over the picture
+    var notice: String?
+    @ObservationIgnored private var noticeTask: Task<Void, Never>?
 
     // settings
     @ObservationIgnored private let defaults = UserDefaults.standard
@@ -382,6 +386,62 @@ final class AppModel {
         return standard.is50Hz ? (progressive ? "288p" : "576i") : (progressive ? "240p" : "480i")
     }
 
+    // MARK: - screenshots
+
+    static var screenshotsFolder: URL {
+        let pictures = FileManager.default.urls(for: .picturesDirectory, in: .userDomainMask).first!
+        return pictures.appending(path: "ManzanaMagica", directoryHint: .isDirectory)
+    }
+
+    var canTakeScreenshot: Bool { phase == .running && status.locked }
+
+    /// Saves the picture on screen as a PNG
+    func takeScreenshot() {
+        guard canTakeScreenshot, let picture = pipeline.currentPicture() else { return }
+        let folder = Self.screenshotsFolder
+        let url = folder.appending(path: "Screenshot \(Self.stamp()).png")
+        nonisolated(unsafe) let owned = picture
+        Task.detached(priority: .userInitiated) {
+            do {
+                try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+                try Screenshot.writePNG(owned, to: url)
+                await MainActor.run {
+                    self.lastScreenshot = url
+                    self.show(notice: String(localized: "Screenshot saved"))
+                    log.info("screenshot: \(url.path, privacy: .public)")
+                }
+            } catch {
+                await MainActor.run { self.alert = String(localized: "The screenshot couldn't be saved: \(error.localizedDescription)") }
+            }
+        }
+    }
+
+    func showScreenshots() {
+        try? FileManager.default.createDirectory(at: Self.screenshotsFolder, withIntermediateDirectories: true)
+        if let lastScreenshot {
+            NSWorkspace.shared.activateFileViewerSelecting([lastScreenshot])
+        } else {
+            NSWorkspace.shared.open(Self.screenshotsFolder)
+        }
+    }
+
+    private func show(notice: String) {
+        self.notice = notice
+        noticeTask?.cancel()
+        noticeTask = Task {
+            try? await Task.sleep(for: .seconds(1.5))
+            if !Task.isCancelled { self.notice = nil }
+        }
+    }
+
+    /// Local date and time for file names
+    static func stamp() -> String {
+        let f = DateFormatter()
+        f.locale = Locale(identifier: "en_US_POSIX")
+        f.dateFormat = "yyyy-MM-dd HH.mm.ss"
+        return f.string(from: .now)
+    }
+
     // MARK: - recording
 
     static var recordingsFolder: URL {
@@ -393,11 +453,7 @@ final class AppModel {
         guard canRecord else { return }
         do {
             try FileManager.default.createDirectory(at: Self.recordingsFolder, withIntermediateDirectories: true)
-            let f = DateFormatter()
-            f.locale = Locale(identifier: "en_US_POSIX")
-            f.dateFormat = "yyyy-MM-dd HH.mm.ss"
-            let stamp = f.string(from: .now)
-            let url = Self.recordingsFolder.appending(path: "Capture \(stamp).mov")
+            let url = Self.recordingsFolder.appending(path: "Capture \(Self.stamp()).mov")
             let r = try Recorder(url: url, options: recordingOptions, standard: standard, audio: audio != nil)
             recording = r
             recordingSeconds = 0

@@ -37,6 +37,7 @@ public final class VideoPipeline: @unchecked Sendable {
     private var history: [VideoFrame] = []
     private var stats = Stats()
     private var format: CMVideoFormatDescription?
+    private var lastPicture: CVPixelBuffer?
 
     /// Pictures carry host-clock timestamps; the layer shows each one this
     /// long after its field was captured. YADIF needs the next frame before
@@ -87,6 +88,9 @@ public final class VideoPipeline: @unchecked Sendable {
     }
 
     public func currentStats() -> Stats { queue.sync { stats } }
+
+    /// The newest picture sent to the display (deinterlaced or line-doubled), for screenshots
+    public func currentPicture() -> CVPixelBuffer? { queue.sync { lastPicture } }
 
     /// From the capture device's USB thread
     public func push(_ frame: VideoFrame) {
@@ -163,6 +167,7 @@ public final class VideoPipeline: @unchecked Sendable {
 
     private func output(_ image: CVPixelBuffer, pts: CMTime, duration: CMTime) {
         stats.output += 1
+        lastPicture = image
         recorder?.appendVideo(image, pts: pts, duration: duration)
 
         if format == nil || !CMVideoFormatDescriptionMatchesImageBuffer(format!, imageBuffer: image) {

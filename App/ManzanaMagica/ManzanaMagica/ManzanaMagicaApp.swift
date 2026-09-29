@@ -33,6 +33,11 @@ struct ManzanaMagicaApp: App {
                     ForEach(DeinterlaceMode.allCases) { Text($0.name).tag($0) }
                 }
                 Divider()
+                Button("Take Screenshot") { model.takeScreenshot() }
+                    .keyboardShortcut("s")
+                    .disabled(!model.canTakeScreenshot)
+                Button("Show Screenshots") { model.showScreenshots() }
+                Divider()
                 if model.recording != nil {
                     Button("Stop Recording") { model.stopRecording() }
                         .keyboardShortcut("r")

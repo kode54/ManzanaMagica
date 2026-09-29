@@ -23,6 +23,17 @@ struct ContentView: View {
                 .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 14))
                 .allowsHitTesting(false)
             }
+            if let notice = model.notice {
+                Text(notice)
+                    .font(.headline)
+                    .padding(.horizontal, 16)
+                    .padding(.vertical, 8)
+                    .background(.regularMaterial, in: Capsule())
+                    .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottom)
+                    .padding(.bottom, 24)
+                    .transition(.opacity)
+                    .allowsHitTesting(false)
+            }
             if model.showStats {
                 StatsHUD()
                     .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
@@ -30,6 +41,7 @@ struct ContentView: View {
             }
         }
         .background(.black)
+        .animation(.easeInOut(duration: 0.2), value: model.notice)
         .navigationTitle("ManzanaMagica")
         .navigationSubtitle(model.statusText)
         .toolbar {
@@ -43,6 +55,15 @@ struct ContentView: View {
                     ForEach(StandardChoice.allCases) { Text($0.name).tag($0) }
                 }
                 .help("Colour standard")
+            }
+            ToolbarItem {
+                Button {
+                    model.takeScreenshot()
+                } label: {
+                    Label("Screenshot", systemImage: "camera")
+                }
+                .disabled(!model.canTakeScreenshot)
+                .help("Save the picture to Pictures/ManzanaMagica (⌘S)")
             }
             ToolbarItem {
                 if model.recording != nil {
