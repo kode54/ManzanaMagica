@@ -1,4 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-only
+#include <stddef.h>
+
 #include "magica.h"
 
 void magica_weave_field(const magica_field *f, int parity, uint8_t *y, int y_stride, uint8_t *cbcr, int cbcr_stride)

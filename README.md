@@ -29,9 +29,9 @@ YADIF deinterlacer.
 ## Command-line tools
 
 ```sh
-swift build
-.build/debug/magica probe                      # identify the chips, show lock status
-.build/debug/magica -v capture --input svideo --seconds 5 --out cap.yuv
+make                                           # or swift build: .build/debug/magica
+./magica probe                                 # identify the chips, show lock status
+./magica -v capture --input svideo --seconds 5 --out cap.yuv
 ffplay -f rawvideo -pixel_format yuyv422 -video_size 720x480 cap.yuv
 .build/debug/mgtool record out.mov --input svideo --seconds 30 --codec hevc --size hd720
 ```
@@ -41,6 +41,7 @@ ffplay -f rawvideo -pixel_format yuyv422 -video_size 720x480 cap.yuv
 ## Building
 
 - **App:** open `App/ManzanaMagica/ManzanaMagica.xcodeproj` in Xcode 27 and run.
+- **`magica` command-line tool:** `make`. This builds with the vendored libusb, so Homebrew isn't needed.
 - **Libraries, tools and tests:** `swift build`, `swift test`.
 
 ## How it works

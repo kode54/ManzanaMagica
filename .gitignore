@@ -1,4 +1,5 @@
 /build/
+/magica
 /compile_commands.json
 *.ts
 /.cache/
