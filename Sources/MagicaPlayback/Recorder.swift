@@ -46,44 +46,50 @@ public struct RecordingOptions: Sendable, Codable, Equatable {
     }
 }
 
-/// Writes deinterlaced video and the audio input to a QuickTime movie. Appends come from
-/// the video and audio queues; the writer itself lives on a private queue.
+/// Writes deinterlaced video and the audio input to a QuickTime movie.
+///
+/// Appends come from the video pipeline's and the audio capture's queues.
+/// Each track then goes through a bounded buffer to its own task, which
+/// hands buffers to the writer with the receivers' async `append`, waiting
+/// whenever the encoder is busy. If it falls more than a couple of seconds
+/// behind, new buffers are dropped (and counted).
 public final class Recorder: @unchecked Sendable {
     public let url: URL
     public let options: RecordingOptions
-    private let queue = DispatchQueue(label: "magica.recorder")
     private let writer: AVAssetWriter
-    private let videoInput: AVAssetWriterInput
-    private let adaptor: AVAssetWriterInputPixelBufferAdaptor
-    private let audioInput: AVAssetWriterInput?
+    /// Orders session start against the first appends
+    private let queue = DispatchQueue(label: "magica.recorder")
+    /// The encoder's input pictures, filled on the video pipeline's queue
+    private let pool: CVMutablePixelBuffer.Pool
     private let scaler: VTPixelTransferSession?
     private let size: (width: Int, height: Int)
     private let hd: Bool
+    private let hasAudio: Bool
+
+    private struct Picture: Sendable {
+        var image: CVReadOnlyPixelBuffer
+        var pts: CMTime
+        var duration: CMTime
+    }
+
+    private let videoFeed: AsyncStream<Picture>.Continuation
+    private let audioFeed: AsyncStream<CMReadySampleBuffer<CMSampleBuffer.DynamicContent>>.Continuation
+    private var tasks: [Task<Void, Never>] = []
 
     // queue-confined
     private var started = false
-    private var startTime: CMTime = .invalid
-    private var lastVideoPTS: CMTime = .invalid
     private var finished = false
-    public private(set) var droppedVideo = 0
-    private var _duration: CMTime = .zero
+    private var startTime: CMTime = .invalid
+    private var lastQueuedPTS: CMTime = .invalid
+
+    // lock
     private let lock = NSLock()
-
     private var _failure: Error?
-    // diagnostics (queue)
-    private var audioNotReady = 0, audioAppended = 0, audioEarly = 0
+    private var _duration: CMTime = .zero
+    private var _startTime: CMTime = .invalid   // the session start, set before any append
+    private var lastVideoPTS: CMTime = .invalid
+    private var videoDropped = 0, audioDropped = 0, audioWritten = 0
     private var firstAudioPTS: CMTime = .invalid, lastAudioEnd: CMTime = .invalid
-
-    /// Counters for debugging stalls
-    public var diagnostics: String {
-        queue.sync {
-            let a = firstAudioPTS.isValid ? (firstAudioPTS - startTime).seconds : .nan
-            let e = lastAudioEnd.isValid ? (lastAudioEnd - startTime).seconds : .nan
-            let v = lastVideoPTS.isValid ? (lastVideoPTS - startTime).seconds : .nan
-            return String(format: "video to %.2fs, not ready %d | audio %.3f…%.2fs, %d appended, %d early, not ready %d | %@",
-                          v, droppedVideo, a, e, audioAppended, audioEarly, audioNotReady, "\(writer.status.rawValue)")
-        }
-    }
 
     /// Seconds recorded so far
     public var duration: Double { lock.withLock { _duration.seconds } }
@@ -91,12 +97,25 @@ public final class Recorder: @unchecked Sendable {
     /// Set once the writer has failed; nothing more gets recorded
     public var failure: Error? { lock.withLock { _failure } }
 
-    private func checkFailed() -> Bool {
-        guard writer.status == .failed else { return false }
+    /// Pictures skipped because the encoder fell too far behind
+    public var droppedVideo: Int { lock.withLock { videoDropped } }
+
+    /// Counters for debugging stalls
+    public var diagnostics: String {
         lock.withLock {
-            if _failure == nil { _failure = writer.error ?? CocoaError(.fileWriteUnknown) }
+            let start = _startTime
+            let a = firstAudioPTS.isValid ? (firstAudioPTS - start).seconds : .nan
+            let e = lastAudioEnd.isValid ? (lastAudioEnd - start).seconds : .nan
+            let v = lastVideoPTS.isValid ? (lastVideoPTS - start).seconds : .nan
+            return String(format: "video to %.2fs, %d dropped | audio %.3f…%.2fs, %d written, %d dropped | status %d",
+                          v, videoDropped, a, e, audioWritten, audioDropped, writer.status.rawValue)
         }
-        return true
+    }
+
+    private func fail(_ error: Error?) {
+        lock.withLock {
+            if _failure == nil { _failure = error ?? writer.error ?? CocoaError(.fileWriteUnknown) }
+        }
     }
 
     /// The whole chain of underlying errors, for messages and logs
@@ -159,17 +178,16 @@ public final class Recorder: @unchecked Sendable {
                 AVVideoCleanApertureVerticalOffsetKey: 0,
             ]
         }
-        videoInput = AVAssetWriterInput(mediaType: .video, outputSettings: settings)
-        videoInput.expectsMediaDataInRealTime = true
-        adaptor = AVAssetWriterInputPixelBufferAdaptor(assetWriterInput: videoInput, sourcePixelBufferAttributes: [
-            kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange,
-            kCVPixelBufferWidthKey as String: size.width,
-            kCVPixelBufferHeightKey as String: size.height,
-            kCVPixelBufferIOSurfacePropertiesKey as String: [:],
-        ])
+        let videoInput = AVAssetWriterInput(mediaType: .video, outputSettings: settings)
         guard writer.canAdd(videoInput) else { throw writer.error ?? CocoaError(.fileWriteUnknown) }
-        writer.add(videoInput)
+        var attributes = CVPixelBufferCreationAttributes(
+            pixelFormatType: CVPixelFormatType(rawValue: kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange),
+            size: CVImageSize(width: size.width, height: size.height))
+        attributes.backing = .ioSurface
+        let videoReceiver = writer.inputPixelBufferReceiver(for: videoInput, pixelBufferAttributes: attributes)
+        pool = try CVMutablePixelBuffer.Pool(pixelBufferAttributes: attributes, configuration: .init(minimumBufferCount: 8))
 
+        var audioReceiver: AVAssetWriterInput.SampleBufferReceiver?
         if audio {
             let a = AVAssetWriterInput(mediaType: .audio, outputSettings: [
                 AVFormatIDKey: kAudioFormatMPEG4AAC,
@@ -177,16 +195,9 @@ public final class Recorder: @unchecked Sendable {
                 AVNumberOfChannelsKey: 2,
                 AVEncoderBitRateKey: options.audioKbps * 1000,
             ])
-            a.expectsMediaDataInRealTime = true
-            if writer.canAdd(a) {
-                writer.add(a)
-                audioInput = a
-            } else {
-                audioInput = nil
-            }
-        } else {
-            audioInput = nil
+            if writer.canAdd(a) { audioReceiver = writer.inputReceiver(for: a) }
         }
+        hasAudio = audioReceiver != nil
 
         var s: VTPixelTransferSession?
         VTPixelTransferSessionCreate(allocator: nil, pixelTransferSessionOut: &s)
@@ -211,91 +222,115 @@ public final class Recorder: @unchecked Sendable {
             }
         }
 
-        guard writer.startWriting() else { throw writer.error ?? CocoaError(.fileWriteUnknown) }
+        // about two seconds of slack for each track before anything is dropped
+        let (videoStream, videoFeed) = AsyncStream.makeStream(of: Picture.self, bufferingPolicy: .bufferingOldest(120))
+        let (audioStream, audioFeed) = AsyncStream.makeStream(
+            of: CMReadySampleBuffer<CMSampleBuffer.DynamicContent>.self, bufferingPolicy: .bufferingOldest(200))
+        self.videoFeed = videoFeed
+        self.audioFeed = audioFeed
+
+        try writer.start()
+
+        tasks.append(Task { [self] in
+            for await p in videoStream {
+                do {
+                    try await videoReceiver.append(p.image, with: p.pts)
+                } catch {
+                    fail(error)
+                    break
+                }
+                lock.withLock {
+                    lastVideoPTS = p.pts
+                    _duration = p.pts + p.duration - _startTime
+                }
+            }
+            videoReceiver.finish()
+        })
+        if let audioReceiver {
+            tasks.append(Task { [self] in
+                for await sample in audioStream {
+                    let pts = sample.presentationTimeStamp, end = pts + sample.duration
+                    do {
+                        try await audioReceiver.append(sample)
+                    } catch {
+                        fail(error)
+                        break
+                    }
+                    lock.withLock {
+                        if !firstAudioPTS.isValid { firstAudioPTS = pts }
+                        lastAudioEnd = end
+                        audioWritten += 1
+                    }
+                }
+                audioReceiver.finish()
+            })
+        } else {
+            audioFeed.finish()
+        }
     }
 
     /// Progressive pictures, host-time stamped, from the video pipeline's queue
     public func appendVideo(_ image: CVPixelBuffer, pts: CMTime, duration: CMTime) {
         guard let out = convert(image) else { return }
         queue.async { [self] in
-            guard !finished, !checkFailed(), writer.status == .writing else { return }
+            guard !finished, failure == nil else { return }
             if !started {
                 writer.startSession(atSourceTime: pts)
                 startTime = pts
+                lock.withLock { _startTime = pts }
                 started = true
             }
-            if lastVideoPTS.isValid, pts <= lastVideoPTS { return }
-            guard videoInput.isReadyForMoreMediaData else {
-                droppedVideo += 1
-                return
-            }
-            if adaptor.append(out, withPresentationTime: pts) {
-                lastVideoPTS = pts
-                lock.withLock { _duration = pts + duration - startTime }
-            } else {
-                _ = checkFailed()
+            if lastQueuedPTS.isValid, pts <= lastQueuedPTS { return }
+            lastQueuedPTS = pts
+            if case .dropped = videoFeed.yield(Picture(image: out, pts: pts, duration: duration)) {
+                lock.withLock { videoDropped += 1 }
             }
         }
     }
 
     /// Audio buffers from the capture session, host-time stamped
     public func appendAudio(_ sample: CMSampleBuffer) {
-        guard let audioInput else { return }
-        nonisolated(unsafe) let sample = sample
+        guard hasAudio else { return }
+        nonisolated(unsafe) let owned = sample
         queue.async { [self] in
-            guard started, !finished, writer.status == .writing else { return }
-            let pts = CMSampleBufferGetPresentationTimeStamp(sample)
-            let end = pts + CMSampleBufferGetDuration(sample)
+            guard started, !finished, failure == nil else { return }
             // nothing from before the first picture
-            guard end > startTime else {
-                audioEarly += 1
-                return
-            }
-            guard audioInput.isReadyForMoreMediaData else {
-                audioNotReady += 1
-                return
-            }
-            if audioInput.append(sample) {
-                if !firstAudioPTS.isValid { firstAudioPTS = pts }
-                lastAudioEnd = end
-                audioAppended += 1
-            } else {
-                _ = checkFailed()
+            let end = CMSampleBufferGetPresentationTimeStamp(owned) + CMSampleBufferGetDuration(owned)
+            guard end > startTime else { return }
+            if case .dropped = audioFeed.yield(CMReadySampleBuffer(unsafeBuffer: owned)) {
+                lock.withLock { audioDropped += 1 }
             }
         }
     }
 
-    /// Closes the file; returns it, or the writer's error
+    /// Closes the file once everything queued is written; returns it, or the writer's error
     public func finish() async throws -> URL {
-        try await withCheckedThrowingContinuation { (cont: CheckedContinuation<URL, Error>) in
+        let started = await withCheckedContinuation { (cont: CheckedContinuation<Bool, Never>) in
             queue.async { [self] in
                 finished = true
-                guard started, writer.status == .writing else {
-                    writer.cancelWriting()
-                    cont.resume(throwing: writer.error ?? CocoaError(.fileWriteUnknown))
-                    return
-                }
-                videoInput.markAsFinished()
-                audioInput?.markAsFinished()
-                writer.endSession(atSourceTime: lastVideoPTS.isValid ? lastVideoPTS : startTime)
-                let writer = self.writer, url = self.url
-                writer.finishWriting {
-                    if writer.status == .completed {
-                        cont.resume(returning: url)
-                    } else {
-                        cont.resume(throwing: writer.error ?? CocoaError(.fileWriteUnknown))
-                    }
-                }
+                videoFeed.finish()
+                audioFeed.finish()
+                cont.resume(returning: self.started)
             }
         }
+        for task in tasks { await task.value }
+        guard started, failure == nil, writer.status == .writing else {
+            let error = failure ?? writer.error ?? CocoaError(.fileWriteUnknown)
+            writer.cancelWriting()
+            throw error
+        }
+        let end = lock.withLock { lastVideoPTS.isValid ? lastVideoPTS : _startTime }
+        writer.endSession(atSourceTime: end)
+        await writer.finishWriting()
+        guard writer.status == .completed else { throw writer.error ?? CocoaError(.fileWriteUnknown) }
+        return url
     }
 
     /// Scales and converts to the encoder's 4:2:0 on the calling queue
-    private func convert(_ image: CVPixelBuffer) -> CVPixelBuffer? {
-        guard let pool = adaptor.pixelBufferPool, let scaler else { return nil }
-        var out: CVPixelBuffer?
-        guard CVPixelBufferPoolCreatePixelBuffer(nil, pool, &out) == kCVReturnSuccess, let out else { return nil }
-        guard VTPixelTransferSessionTransferImage(scaler, from: image, to: out) == noErr else { return nil }
-        return out
+    private func convert(_ image: CVPixelBuffer) -> CVReadOnlyPixelBuffer? {
+        guard let scaler, let out = try? pool.makeMutablePixelBuffer() else { return nil }
+        let status = out.withUnsafeBuffer { VTPixelTransferSessionTransferImage(scaler, from: image, to: $0) }
+        guard status == noErr else { return nil }
+        return CVReadOnlyPixelBuffer(out)
     }
 }
