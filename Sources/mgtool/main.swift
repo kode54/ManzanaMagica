@@ -80,8 +80,8 @@ while Date().timeIntervalSince(start) < seconds {
     }
     if verbose { print("       " + recorder.diagnostics) }
     let s = pipeline.currentStats(), st = device.status()
-    print(String(format: "%5.1fs  frames %d → %d pictures, dropped %d, incomplete %d, GPU %.2f ms/field, fields %u short %u",
-                 recorder.duration, s.frames, s.output, s.dropped, s.incomplete, s.gpuTime * 1000, st.fields, st.shortFields))
+    print(String(format: "%5.1fs  frames %d → %d pictures, dropped %d, incomplete %d, renderer flushes %d, GPU %.2f ms/field, fields %u short %u",
+                 recorder.duration, s.frames, s.output, s.dropped, s.incomplete, s.rendererFlushes, s.gpuTime * 1000, st.fields, st.shortFields))
 }
 device.stop()
 capture?.stop()

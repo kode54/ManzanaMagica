@@ -15,10 +15,16 @@ public final class VideoPipeline: @unchecked Sendable {
         public var incomplete = 0       // frames with a field cut short
         public var gpuTime: Double = 0  // last field, seconds
         public var mode: DeinterlaceMode = .yadif
+        public var rendererFlushes = 0  // the renderer failed and was flushed to resume
         public init() {}
     }
 
     public let layer: AVSampleBufferDisplayLayer
+    /// Paces the layer on the host clock (there's no audio renderer to drive it)
+    private let synchronizer = AVSampleBufferRenderSynchronizer()
+    /// The layer's renderer, attached to the synchronizer; used only on `queue`
+    private let receiver: AVSampleBufferVideoRenderer.Receiver
+    private var eventTask: Task<Void, Never>?
     private let queue = DispatchQueue(label: "magica.video", qos: .userInteractive)
     private let deinterlacer: Deinterlacer?
     private let lock = NSLock()
@@ -36,19 +42,37 @@ public final class VideoPipeline: @unchecked Sendable {
     /// it can output a frame's first field, so it sets the floor.
     public static let latency = 0.085
 
+    /// On the main actor, like the layer it configures
+    @MainActor
     public init(layer: AVSampleBufferDisplayLayer, mode: DeinterlaceMode = .yadif) {
         self.layer = layer
         _mode = mode
         deinterlacer = try? Deinterlacer()
         layer.videoGravity = .resizeAspect
-        var tb: CMTimebase?
-        CMTimebaseCreateWithSourceClock(allocator: nil, sourceClock: CMClockGetHostTimeClock(), timebaseOut: &tb)
-        if let tb {
-            CMTimebaseSetTime(tb, time: CMClockGetTime(CMClockGetHostTimeClock()) - CMTime(seconds: Self.latency,
-                                                                                         preferredTimescale: 1_000_000))
-            CMTimebaseSetRate(tb, rate: 1)
-            layer.controlTimebase = tb
+        receiver = synchronizer.sampleBufferReceiver(adding: layer.sampleBufferRenderer)
+        // live: run now, whatever is queued, with the timebase `latency` behind the host clock
+        synchronizer.delaysRateChangeUntilHasSufficientMediaData = false
+        let now = CMClockGetTime(CMClockGetHostTimeClock())
+        synchronizer.setRate(1, time: now - CMTime(seconds: Self.latency, preferredTimescale: 1_000_000), atHostTime: now)
+
+        let events = receiver.renderingEventsAfterFinishedEnqueuing
+        eventTask = Task { [weak self] in
+            for await event in events {
+                switch event {
+                case .requiresFlushToResumeDecoding, .failed:
+                    guard let pipeline = self else { return }
+                    pipeline.queue.async { pipeline.flushRenderer() }
+                case .didFailToDecode:
+                    break
+                @unknown default:
+                    break
+                }
+            }
         }
+    }
+
+    deinit {
+        eventTask?.cancel()
     }
 
     public var mode: DeinterlaceMode {
@@ -85,7 +109,8 @@ public final class VideoPipeline: @unchecked Sendable {
     public func reset() {
         queue.async {
             self.history.removeAll()
-            self.layer.sampleBufferRenderer.flush(removingDisplayedImage: false, completionHandler: nil)
+            // keeps showing the last picture until new ones arrive
+            self.receiver.flush()
         }
     }
 
@@ -148,8 +173,21 @@ public final class VideoPipeline: @unchecked Sendable {
         CMSampleBufferCreateReadyWithImageBuffer(allocator: nil, imageBuffer: image, formatDescription: format,
                                                  sampleTiming: &timing, sampleBufferOut: &sample)
         guard let sample else { return }
-        let renderer = layer.sampleBufferRenderer
-        if renderer.status == .failed { renderer.flush() }
-        renderer.enqueue(sample)
+        // handed over for good: nothing here touches the sample after this
+        nonisolated(unsafe) let owned = sample
+        switch receiver.enqueueImmediately(CMReadySampleBuffer(unsafeBuffer: owned)) {
+        case .enqueued, .enqueuedWithDecodeFailures, .cancelledDueToFlush:
+            break
+        case .cancelledDueToFlushRequiredToResume, .cancelledDueToError:
+            flushRenderer()
+        @unknown default:
+            break
+        }
+    }
+
+    /// Clears a failed renderer so the next picture can go through
+    private func flushRenderer() {
+        stats.rendererFlushes += 1
+        receiver.flush()
     }
 }
